@@ -1,0 +1,31 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.37301.10 d17.14
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "VENM", "VENM\VENM.csproj", "{A5AA7B22-D7AE-4E42-8834-DC40093F729E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "VENMLibrary", "VENMLibrary\VENMLibrary.csproj", "{C567CFA6-F13D-4661-858D-59CF85B8ED90}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{A5AA7B22-D7AE-4E42-8834-DC40093F729E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A5AA7B22-D7AE-4E42-8834-DC40093F729E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A5AA7B22-D7AE-4E42-8834-DC40093F729E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A5AA7B22-D7AE-4E42-8834-DC40093F729E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C567CFA6-F13D-4661-858D-59CF85B8ED90}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C567CFA6-F13D-4661-858D-59CF85B8ED90}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C567CFA6-F13D-4661-858D-59CF85B8ED90}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C567CFA6-F13D-4661-858D-59CF85B8ED90}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {5A08FAF7-0AF2-4D61-97F6-20461F529B3A}
+	EndGlobalSection
+EndGlobal
