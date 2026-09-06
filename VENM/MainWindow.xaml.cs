@@ -25,6 +25,7 @@ namespace VENM
         {
             InitializeComponent();
             Loaded += MainWindow_Loaded;
+            Closed += MainWindow_Closed; // 🔹 Освобождение ресурсов при закрытии окна
 
             _modeActions = new Dictionary<EditMode, Action>
             {
@@ -48,6 +49,13 @@ namespace VENM
 
         private void MainWindow_Loaded(object sender, RoutedEventArgs e)
         {
+            // 🔹 Глобальная защита от необработанных исключений
+            Application.Current.DispatcherUnhandledException += (s, args) =>
+            {
+                ShowError($"Необработанная ошибка: {args.Exception.Message}");
+                args.Handled = true;
+            };
+
             FileDirManager.Initialize();
             _isAutoSaveEnabled = FileDirManager.LoadAutoSaveState();
             AutoSave.IsChecked = _isAutoSaveEnabled;
@@ -60,6 +68,18 @@ namespace VENM
             EditMode savedMode = Enum.TryParse<EditMode>(savedModeStr, out var m) ? m : EditMode.Scene;
             SetRadioButtonChecked(savedMode);
             SwitchEditMode(savedMode);
+        }
+
+        private void MainWindow_Closed(object? sender, EventArgs e)
+        {
+            // Сначала сохраняем открытый файл, если он существует и валиден
+            SaveCurrentFileSilently();
+
+            // Полностью останавливаем фоновый таймер автосохранения
+            FileDirManager.StopAutoSave();
+
+            // Гарантируем завершение приложения
+            Application.Current?.Shutdown();
         }
 
         #region Переключение режимов
@@ -89,8 +109,9 @@ namespace VENM
 
             RefreshAllComboBoxes();
 
-            if (newMode != EditMode.Font && ComboScene.SelectedItem != null)
-                ProcessSelection(ComboScene);
+            // 🔹 УДАЛЕНО: Принудительный вызов ProcessSelection(ComboScene).
+            // Теперь пользователь сам выбирает сцену/объект из списка, 
+            // что гарантирует корректное срабатывание SelectionChanged.
 
             _isProcessing = false;
             UpdateUIForMode();
@@ -146,7 +167,11 @@ namespace VENM
         {
             UpdateComboBox(ComboScene, FileDirManager.GetScenes(), _currentScene);
             UpdateComboBox(ComboObject, _currentScene != null ? FileDirManager.GetObjects(_currentScene) : new List<string>(), _currentObject);
-            UpdateComboBox(ComboFile, _currentEditMode == EditMode.Font ? FileDirManager.GetFonts() : GetFilesForCurrentSelection(), _currentFile);
+
+            // 🔹 ИСПРАВЛЕНИЕ: В режиме шрифтов ComboFile показывает только .ttf/.otf файлы.
+            // Не передаем _currentFile (равный "parameters.json") в качестве выбранного элемента, чтобы не ломать UI.
+            string? fileSel = _currentEditMode == EditMode.Font ? null : _currentFile;
+            UpdateComboBox(ComboFile, _currentEditMode == EditMode.Font ? FileDirManager.GetFonts() : GetFilesForCurrentSelection(), fileSel);
         }
 
         private List<string> GetFilesForCurrentSelection() => _currentEditMode switch
@@ -159,7 +184,12 @@ namespace VENM
         private void UpdateComboBox(ComboBox c, List<string> items, string? sel)
         {
             c.ItemsSource = items;
-            c.SelectedItem = sel ?? (items.Count > 0 ? items[0] : null);
+            // 🔹 ИСПРАВЛЕНИЕ: Выделяем элемент только если он явно передан и существует в списке.
+            // Иначе сбрасываем выделение в null.
+            if (sel != null && items.Contains(sel))
+                c.SelectedItem = sel;
+            else
+                c.SelectedItem = null;
         }
 
         private void ProcessSelection(ComboBox sender)
@@ -176,16 +206,44 @@ namespace VENM
             if (sender == ComboScene)
             {
                 _currentScene = selectedName;
-                _currentObject = null; _currentFile = null;
-                UpdateComboBox(ComboObject, FileDirManager.GetObjects(_currentScene), null);
-                if (ComboObject.SelectedItem != null)
+                _currentObject = null;
+                _currentFile = null;
+
+                if (_currentEditMode == EditMode.Scene)
                 {
-                    _currentObject = ComboObject.SelectedItem.ToString();
-                    UpdateComboBox(ComboFile, GetFilesForCurrentSelection(), null);
-                    if (ComboFile.SelectedItem != null)
+                    var files = GetFilesForCurrentSelection();
+                    UpdateComboBox(ComboFile, files, null);
+                    if (files.Count > 0)
                     {
-                        _currentFile = ComboFile.SelectedItem.ToString();
+                        ComboFile.SelectedIndex = 0;
+                        _currentFile = files[0];
                         LoadSelectedFile();
+                    }
+                }
+                else if (_currentEditMode == EditMode.Object)
+                {
+                    var objects = FileDirManager.GetObjects(_currentScene);
+                    UpdateComboBox(ComboObject, objects, null);
+
+                    if (objects.Count > 0)
+                    {
+                        ComboObject.SelectedIndex = 0;
+                        _currentObject = objects[0];
+
+                        var objFiles = GetFilesForCurrentSelection();
+                        UpdateComboBox(ComboFile, objFiles, null);
+                        if (objFiles.Count > 0)
+                        {
+                            ComboFile.SelectedIndex = 0;
+                            _currentFile = objFiles[0];
+                            LoadSelectedFile();
+                        }
+                    }
+                    else
+                    {
+                        // 🔹 ИСПРАВЛЕНИЕ БАГА 2: Если в сцене нет объектов, принудительно очищаем ComboFile.
+                        // Это предотвращает отображение "фантомных" файлов из предыдущей сцены.
+                        UpdateComboBox(ComboFile, new List<string>(), null);
                     }
                 }
             }
@@ -193,10 +251,12 @@ namespace VENM
             {
                 _currentObject = selectedName;
                 _currentFile = null;
-                UpdateComboBox(ComboFile, GetFilesForCurrentSelection(), null);
-                if (ComboFile.SelectedItem != null)
+                var files = GetFilesForCurrentSelection();
+                UpdateComboBox(ComboFile, files, null);
+                if (files.Count > 0)
                 {
-                    _currentFile = ComboFile.SelectedItem.ToString();
+                    ComboFile.SelectedIndex = 0;
+                    _currentFile = files[0];
                     LoadSelectedFile();
                 }
             }
@@ -242,10 +302,20 @@ namespace VENM
         private void LoadFontParameters()
         {
             string path = FileDirManager.GetFontParametersPath();
-            _currentFile = "parameters.json";
+            _currentFile = "parameters.json"; // Убран лишний пробел
             _fileEditView?.SetMode(".json", false);
             _fileEditView?.LoadEditorContent(File.Exists(path) ? FileDirManager.LoadFile(path) : "{}");
-            _fileEditView?.LoadPreviewContent("{\n  \"size\": 16,\n  \"color\": \"#FFFFFF\"\n}");
+
+            // 🔹 ИСПРАВЛЕНИЕ БАГА 1: 
+            // Для шрифтов путь к превью всегда фиксирован и не зависит от GetTipFilePath.
+            // Читаем parameters_tip.json напрямую из папки FontsPath.
+            string tip = Path.Combine(FileDirManager.FontsPath, "parameters_tip.json");
+            string preview = File.Exists(tip)
+                ? FileDirManager.LoadFile(tip)
+                : "Демо-структура не загружена.\nНажмите 'Создать демо-структуру' для просмотра примеров.";
+
+            _fileEditView?.LoadPreviewContent(preview);
+
             if (_isAutoSaveEnabled) FileDirManager.SetupAutoSave(path, _fileEditView!.GetContent(), _ => true, msg => ShowError(msg));
         }
 
@@ -336,7 +406,26 @@ namespace VENM
         {
             if (string.IsNullOrEmpty(_currentScene)) return false;
             if (MessageBox.Show($"Удалить сцену '{_currentScene}'?", "Подтверждение", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return false;
-            if (FileDirManager.DeleteScene(_currentScene, out string err)) { _currentScene = null; RefreshAllComboBoxes(); ShowNotification("Сцена удалена"); return true; }
+
+            string sceneToDelete = _currentScene;
+
+            // 1. Безопасно закрываем текущий файл и останавливаем таймер ДО удаления
+            SaveCurrentFileSilently();
+            FileDirManager.StopAutoSave();
+
+            // 2. Сбрасываем состояние
+            _currentScene = null;
+            _currentObject = null; // Объекты тоже сбрасываем, так как сцена удалена
+            _currentFile = null;
+            ShowFileClosedState(); // Очищаем UI редактора
+
+            // 3. Физическое удаление
+            if (FileDirManager.DeleteScene(sceneToDelete, out string err))
+            {
+                RefreshAllComboBoxes();
+                ShowNotification("Сцена удалена");
+                return true;
+            }
             ShowError(err); return false;
         }
 
@@ -344,16 +433,54 @@ namespace VENM
         {
             if (string.IsNullOrEmpty(_currentObject) || string.IsNullOrEmpty(_currentScene)) return false;
             if (MessageBox.Show($"Удалить объект '{_currentObject}'?", "Подтверждение", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return false;
-            if (FileDirManager.DeleteObject(_currentScene, _currentObject, out string err)) { _currentObject = null; RefreshAllComboBoxes(); ShowNotification("Объект удалён"); return true; }
+
+            string scene = _currentScene;
+            string objToDelete = _currentObject;
+
+            // 1. Остановка таймера и сохранение (на случай, если папка еще существует)
+            SaveCurrentFileSilently();
+            FileDirManager.StopAutoSave();
+
+            // 2. Сброс состояния
+            _currentObject = null;
+            _currentFile = null;
+            ShowFileClosedState();
+
+            // 3. Удаление
+            if (FileDirManager.DeleteObject(scene, objToDelete, out string err))
+            {
+                RefreshAllComboBoxes();
+                ShowNotification("Объект удалён");
+                return true;
+            }
             ShowError(err); return false;
         }
 
         private bool DeleteFont()
         {
-            string? fontName = ComboFile.SelectedItem?.ToString() ?? _currentFile;
-            if (string.IsNullOrEmpty(fontName)) { ShowError("Выберите шрифт для удаления."); return false; }
+            // 🔹 ИСПРАВЛЕНИЕ: Игнорируем _currentFile (он указывает на parameters.json).
+            // Удаляем только если пользователь явно выбрал .ttf/.otf файл в списке.
+            if (ComboFile.SelectedItem is not string fontName)
+            {
+                ShowError("Выберите шрифт из списка для удаления.");
+                return false;
+            }
+
+            // 🔹 ДОПОЛНИТЕЛЬНАЯ ЗАЩИТА: На всякий случай блокируем удаление файла настроек
+            if (fontName.Equals("parameters.json", StringComparison.OrdinalIgnoreCase))
+            {
+                ShowError("Нельзя удалить глобальный файл настроек шрифтов.");
+                return false;
+            }
+
             if (MessageBox.Show($"Удалить шрифт '{fontName}'?", "Подтверждение", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return false;
-            if (FileDirManager.DeleteFont(fontName, out string err)) { RefreshAllComboBoxes(); ShowNotification("Шрифт удалён"); return true; }
+
+            if (FileDirManager.DeleteFont(fontName, out string err))
+            {
+                RefreshAllComboBoxes();
+                ShowNotification("Шрифт удалён");
+                return true;
+            }
             ShowError(err); return false;
         }
         #endregion
@@ -366,8 +493,36 @@ namespace VENM
             var d = new TextInputDialog("Переименование", "Новое название:", old);
             if (d.ShowDialog() != true || string.IsNullOrWhiteSpace(d.Result)) return;
             string n = d.Result.Trim();
+
+            // Проверяем, является ли переименовываемый элемент текущим открытым
+            bool isOpen = (mode == EditMode.Scene && old == _currentScene) ||
+                          (mode == EditMode.Object && old == _currentObject);
+
+            if (isOpen)
+            {
+                SaveCurrentFileSilently();
+                FileDirManager.StopAutoSave(); // Останавливаем таймер, чтобы он не писал в старую папку
+            }
+
             bool ok = mode == EditMode.Scene ? FileDirManager.RenameScene(old, n, out string err) : FileDirManager.RenameObject(_currentScene!, old, n, out err);
-            if (ok) { if (mode == EditMode.Scene) _currentScene = n; else _currentObject = n; RefreshAllComboBoxes(); ShowNotification("Переименовано"); }
+            if (ok)
+            {
+                if (mode == EditMode.Scene) _currentScene = n;
+                else _currentObject = n;
+
+                // Блокируем события, чтобы RefreshAllComboBoxes не вызвал лишнюю загрузку
+                _isProcessing = true;
+                RefreshAllComboBoxes();
+                _isProcessing = false;
+
+                if (isOpen)
+                {
+                    // Перезагружаем файл, чтобы обновить _currentFilePath для таймера автосохранения
+                    LoadSelectedFile();
+                }
+
+                ShowNotification("Переименовано");
+            }
             else ShowError(err);
         }
 

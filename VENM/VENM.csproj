@@ -5,7 +5,10 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <UseWPF>true</UseWPF>
-    <ApplicationIcon>App.ico</ApplicationIcon>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <StartupObject>VENM.App</StartupObject>
+    <AssemblyName>$(MSBuildVENM)</AssemblyName>
+    <RootNamespace>$(MSBuildVENM.Replace(" ", "_"))</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>

@@ -18,8 +18,16 @@ namespace VENMLibrary
 
         private static readonly char[] InvalidNameChars = Path.GetInvalidFileNameChars();
 
+        // 🔹 UTF-8 без BOM для всех файлов (.txt, .json, .csv)
+        private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
+
         private static readonly TimeSpan AutoSaveInterval = TimeSpan.FromSeconds(30);
         private static System.Threading.Timer? _autoSaveTimer;
+
+        // 🔹 Состояние для безопасного завершения таймера
+        private static readonly object _timerLock = new object();
+        private static bool _isShuttingDown = false;
+
         private static string? _currentFilePath;
         private static string? _currentContent;
         private static Func<string, bool>? _validationCallback;
@@ -70,7 +78,7 @@ namespace VENMLibrary
                 var lines = File.Exists(ConfigPath) ? File.ReadAllLines(ConfigPath).ToList() : new List<string>();
                 lines.RemoveAll(l => l.StartsWith($"{key};", StringComparison.OrdinalIgnoreCase));
                 lines.Add($"{key};{value}");
-                File.WriteAllLines(ConfigPath, lines);
+                File.WriteAllLines(ConfigPath, lines, Utf8NoBom); // 🔹 Явно указываем UTF-8 без BOM
             }
             catch { /* Игнорируем ошибки записи конфига */ }
         }
@@ -82,6 +90,15 @@ namespace VENMLibrary
             error = string.Empty;
             if (string.IsNullOrWhiteSpace(name)) { error = "Имя не может быть пустым."; return false; }
 
+            // 🔹 НОВАЯ ПРОВЕРКА: Защита от системных подстрок
+            if (name.Contains("_tip", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("example", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("bolvanka", StringComparison.OrdinalIgnoreCase))
+            {
+                error = "Имя содержит зарезервированные системные слова (_tip, example, bolvanka).";
+                return false;
+            }
+
             var invalidIndex = name.IndexOfAny(InvalidNameChars);
             if (invalidIndex >= 0) { error = $"Имя содержит запрещённый символ: '{name[invalidIndex]}'"; return false; }
             if (name.Contains(' ')) { error = "Пробелы в имени запрещены."; return false; }
@@ -92,31 +109,110 @@ namespace VENMLibrary
 
         public static void SetupAutoSave(string filePath, string content, Func<string, bool> validator, Action<string> onError)
         {
-            _currentFilePath = filePath;
-            _currentContent = content;
-            _validationCallback = validator;
-            _saveErrorCallback = onError;
+            lock (_timerLock)
+            {
+                _isShuttingDown = false;
 
-            _autoSaveTimer?.Dispose();
-            _autoSaveTimer = new System.Threading.Timer(AutoSaveCallback, null, AutoSaveInterval, AutoSaveInterval);
+                _currentFilePath = filePath;
+                _currentContent = content;
+                _validationCallback = validator;
+                _saveErrorCallback = onError;
+
+                _autoSaveTimer?.Dispose();
+                _autoSaveTimer = new System.Threading.Timer(AutoSaveCallback, null, AutoSaveInterval, AutoSaveInterval);
+            }
         }
 
-        public static void StopAutoSave() => _autoSaveTimer?.Dispose();
+        public static void StopAutoSave()
+        {
+            lock (_timerLock)
+            {
+                _isShuttingDown = true;
+
+                var timer = _autoSaveTimer;
+                _autoSaveTimer = null;
+
+                if (timer != null)
+                {
+                    // Ждём завершения текущего колбэка, но не более 2 секунд,
+                    // чтобы закрытие приложения не зависло навсегда.
+                    using var waitHandle = new System.Threading.EventWaitHandle(
+                        false,
+                        System.Threading.EventResetMode.ManualReset
+                    );
+
+                    if (timer.Dispose(waitHandle))
+                        waitHandle.WaitOne(TimeSpan.FromSeconds(2));
+                    else
+                        timer.Dispose();
+                }
+
+                _currentFilePath = null;
+                _currentContent = null;
+                _validationCallback = null;
+                _saveErrorCallback = null;
+            }
+        }
 
         private static void AutoSaveCallback(object? state)
         {
-            if (string.IsNullOrEmpty(_currentFilePath) || _validationCallback == null || _currentContent == null) return;
+            if (_isShuttingDown) return;
+
+            string? filePath;
+            string? content;
+            Func<string, bool>? validator;
+            Action<string>? errorCallback;
+
+            // Локально фиксируем состояние, чтобы оно не обнулилось во время выполнения
+            lock (_timerLock)
+            {
+                if (_isShuttingDown) return;
+
+                filePath = _currentFilePath;
+                content = _currentContent;
+                validator = _validationCallback;
+                errorCallback = _saveErrorCallback;
+            }
+
+            if (string.IsNullOrEmpty(filePath) || validator == null || content == null) return;
+
+            var dispatcher = Application.Current?.Dispatcher;
+
+            // Если приложение уже закрывается или закрыто — ничего не делаем
+            if (dispatcher == null || dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished)
+                return;
+
             try
             {
-                Application.Current.Dispatcher.Invoke(() =>
+                // 🔹 BeginInvoke вместо Invoke, чтобы фоновый поток таймера
+                // не блокировался навсегда при завершении приложения.
+                dispatcher.BeginInvoke(new Action(() =>
                 {
-                    if (_validationCallback!(_currentContent!))
-                        File.WriteAllText(_currentFilePath!, _currentContent!, Encoding.UTF8);
-                    else
-                        _saveErrorCallback?.Invoke("Автосохранение пропущено: файл содержит ошибки.");
-                });
+                    if (_isShuttingDown) return;
+
+                    try
+                    {
+                        if (validator(content))
+                        {
+                            File.WriteAllText(_currentFilePath!, _currentContent!, Utf8NoBom); // 🔹 UTF-8 без BOM
+                        }
+                        else
+                        {
+                            errorCallback?.Invoke("Автосохранение пропущено: файл содержит ошибки.");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!_isShuttingDown)
+                            errorCallback?.Invoke($"Ошибка автосохранения: {ex.Message}");
+                    }
+                }));
             }
-            catch (Exception ex) { _saveErrorCallback?.Invoke($"Ошибка автосохранения: {ex.Message}"); }
+            catch (Exception ex)
+            {
+                if (!_isShuttingDown)
+                    errorCallback?.Invoke($"Ошибка автосохранения: {ex.Message}");
+            }
         }
 
         public static bool ValidateJson(string json)
@@ -144,7 +240,7 @@ namespace VENMLibrary
                 }
 
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-                File.WriteAllText(path, saveContent, Encoding.UTF8);
+                File.WriteAllText(path, saveContent, Utf8NoBom); // 🔹 UTF-8 без BOM
                 return true;
             }
             catch (Exception ex) { error = $"Ошибка записи: {ex.Message}"; return false; }
@@ -167,13 +263,18 @@ namespace VENMLibrary
 
         public static string GetTipFilePath(string currentFilePath)
         {
-            if (!File.Exists(currentFilePath)) return string.Empty;
+            // 🔹 ИСПРАВЛЕНИЕ: Убираем проверку File.Exists(currentFilePath).
+            // Файл может быть еще не создан на диске, но мы всё равно должны найти для него тип.
+            if (string.IsNullOrEmpty(currentFilePath)) return string.Empty;
+
             string rel = Path.GetRelativePath(AssetsPath, currentFilePath);
             string[] parts = rel.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
             string tip = parts.Length == 3
-                ? Path.Combine(AssetsPath, "scenes", "example_tip", parts[2])
+                 ? Path.Combine(AssetsPath, "scenes", "example_tip", parts[2])
                 : parts.Length >= 4 ? Path.Combine(AssetsPath, "scenes", "example_tip", "bolvanka", parts[3])
                 : Path.Combine(FontsPath, "parameters_tip.json");
+
             return File.Exists(tip) ? tip : string.Empty;
         }
 
@@ -185,8 +286,8 @@ namespace VENMLibrary
             string path = Path.Combine(ScenesPath, name);
             if (Directory.Exists(path)) { error = "Сцена с таким именем уже существует."; return false; }
             Directory.CreateDirectory(path);
-            File.WriteAllText(Path.Combine(path, "parameters.json"), "{}", Encoding.UTF8);
-            File.WriteAllText(Path.Combine(path, "script.txt"), "// Скрипт сцены", Encoding.UTF8);
+            File.WriteAllText(Path.Combine(path, "parameters.json"), "{}", Utf8NoBom);
+            File.WriteAllText(Path.Combine(path, "script.txt"), "// Скрипт сцены", Utf8NoBom);
             return true;
         }
 
@@ -220,9 +321,9 @@ namespace VENMLibrary
             string path = Path.Combine(ScenesPath, sceneName, objName);
             if (Directory.Exists(path)) { error = "Объект с таким именем уже существует."; return false; }
             Directory.CreateDirectory(path);
-            File.WriteAllText(Path.Combine(path, "parameters.json"), "{}", Encoding.UTF8);
-            File.WriteAllText(Path.Combine(path, "events.json"), "{}", Encoding.UTF8);
-            File.WriteAllText(Path.Combine(path, "speech.txt"), "// Реплики", Encoding.UTF8);
+            File.WriteAllText(Path.Combine(path, "parameters.json"), "{}", Utf8NoBom);
+            File.WriteAllText(Path.Combine(path, "events.json"), "{}", Utf8NoBom);
+            File.WriteAllText(Path.Combine(path, "speech.txt"), "// Реплики", Utf8NoBom);
             return true;
         }
 
@@ -271,13 +372,13 @@ namespace VENMLibrary
         {
             string sc = Path.Combine(ScenesPath, "example_tip"); if (Directory.Exists(sc)) return;
             Directory.CreateDirectory(sc);
-            File.WriteAllText(Path.Combine(sc, "parameters.json"), "{\n  \"name\": \"Пример сцены\",\n  \"bg\": \"image.jpg\"\n}", Encoding.UTF8);
-            File.WriteAllText(Path.Combine(sc, "script.txt"), "show bg\nsay \"Привет\"", Encoding.UTF8);
+            File.WriteAllText(Path.Combine(sc, "parameters.json"), "{\n  \"name\": \"Пример сцены\",\n  \"bg\": \"image.jpg\"\n}", Utf8NoBom);
+            File.WriteAllText(Path.Combine(sc, "script.txt"), "show bg\nsay \"Привет\"", Utf8NoBom);
             string ob = Path.Combine(sc, "bolvanka"); Directory.CreateDirectory(ob);
-            File.WriteAllText(Path.Combine(ob, "parameters.json"), "{\n  \"name\": \"Болванка\"\n}", Encoding.UTF8);
-            File.WriteAllText(Path.Combine(ob, "events.json"), "{\n  \"onClick\": \"start\"\n}", Encoding.UTF8);
-            File.WriteAllText(Path.Combine(ob, "speech.txt"), "Болванка: Пример текста", Encoding.UTF8);
-            File.WriteAllText(Path.Combine(FontsPath, "parameters_tip.json"), "{\n  \"size\": 16,\n  \"color\": \"#FFFFFF\"\n}", Encoding.UTF8);
+            File.WriteAllText(Path.Combine(ob, "parameters.json"), "{\n  \"name\": \"Болванка\"\n}", Utf8NoBom);
+            File.WriteAllText(Path.Combine(ob, "events.json"), "{\n  \"onClick\": \"start\"\n}", Utf8NoBom);
+            File.WriteAllText(Path.Combine(ob, "speech.txt"), "Болванка: Пример текста", Utf8NoBom);
+            File.WriteAllText(Path.Combine(FontsPath, "parameters_tip.json"), "{\n  \"size\": 16,\n  \"color\": \"#FFFFFF\"\n}", Utf8NoBom);
         }
 
         public static bool IsDemoPath(string p) => p.Contains("_tip") || p.Contains("example_tip") || p.Contains("bolvanka");
