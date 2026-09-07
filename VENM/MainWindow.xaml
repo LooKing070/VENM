@@ -32,7 +32,7 @@
                 </Grid.RowDefinitions>
 
                 <StackPanel Grid.Row="0" Margin="0,0,0,10">
-                    <TextBlock Text="Язык:" Margin="0,0,0,3"/>
+                    <TextBlock x:Name="LblLanguage" Text="Язык:" Margin="0,0,0,3"/>
                     <ComboBox x:Name="ComboLanguage" SelectionChanged="ComboLanguage_SelectionChanged"/>
                 </StackPanel>
 
@@ -81,12 +81,13 @@
 
             <!-- Просмотрщик сцены -->
             <Border Grid.Row="0" Margin="10,10,10,0" BorderBrush="Gray" BorderThickness="1"
-                    Background="Black" ClipToBounds="True">
+            Background="Black" ClipToBounds="True"
+            AllowDrop="True" Drop="SceneCanvas_Drop" DragOver="SceneCanvas_DragOver">
                 <Viewbox Stretch="Uniform">
                     <Canvas x:Name="SceneCanvas" Width="1920" Height="1080" Background="#1E1E1E"
-                            MouseLeftButtonDown="SceneCanvas_MouseDown"
-                            MouseMove="SceneCanvas_MouseMove"
-                            PreviewMouseLeftButtonUp="SceneCanvas_MouseUp"/>
+                MouseLeftButtonDown="SceneCanvas_MouseDown"
+                MouseMove="SceneCanvas_MouseMove"
+                PreviewMouseLeftButtonUp="SceneCanvas_MouseUp"/>
                 </Viewbox>
             </Border>
 
