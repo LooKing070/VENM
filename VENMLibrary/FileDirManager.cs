@@ -99,6 +99,7 @@ namespace VENMLibrary
             catch { }
             return "left";
         }
+
         public static void SavePanelPosition(string position) => SaveConfigLine("PanelPosition", position);
 
         public static Dictionary<string, List<string>> LoadHiddenObjects()
