@@ -387,35 +387,23 @@ namespace VENMLibrary
         {
             error = string.Empty;
             if (!File.Exists(sourcePath)) { error = "Файл не найден."; return string.Empty; }
-
             string ext = Path.GetExtension(sourcePath).ToLowerInvariant();
             if (ext != ".png" && ext != ".jpg" && ext != ".jpeg")
             {
                 error = "Поддерживаются только форматы .png, .jpg, .jpeg.";
                 return string.Empty;
             }
-
             string fileName = Path.GetFileName(sourcePath);
             string destPath = Path.Combine(TexturesPath, fileName);
 
-            if (File.Exists(destPath))
+            // 🔹 Копируем ТОЛЬКО если файла ещё нет. Иначе используем существующий.
+            if (!File.Exists(destPath))
             {
-                string nameNoExt = Path.GetFileNameWithoutExtension(fileName);
-                int counter = 1;
-                do
-                {
-                    fileName = $"{nameNoExt}_{counter}{ext}";
-                    destPath = Path.Combine(TexturesPath, fileName);
-                    counter++;
-                } while (File.Exists(destPath));
+                try { File.Copy(sourcePath, destPath, false); }
+                catch (Exception ex) { error = $"Ошибка копирования: {ex.Message}"; return string.Empty; }
             }
 
-            try
-            {
-                File.Copy(sourcePath, destPath, false);
-                return Path.Combine("textures", fileName).Replace('\\', '/');
-            }
-            catch (Exception ex) { error = $"Ошибка копирования: {ex.Message}"; return string.Empty; }
+            return Path.Combine("textures", fileName).Replace('\\', '/');
         }
         public static bool CreateObjectWithParameters(string sceneName, string objName,
             string spriteRelPath, string objectType, double x, double y, double w, double h,

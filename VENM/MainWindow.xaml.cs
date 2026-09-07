@@ -11,7 +11,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using VENMLibrary;
-using Path = System.IO.Path; // 🔹 Явно указываем, что Path — это System.IO.Path
+using Path = System.IO.Path;
 
 namespace VENM
 {
@@ -20,23 +20,21 @@ namespace VENM
         private enum EditMode { None, Scene, Object, Font }
         private EditMode _currentEditMode = EditMode.None;
 
-        private static readonly Dictionary<EditMode, string> ModeLocKeys = new()
+        private static readonly Dictionary<EditMode, string> ModeDisplayNames = new()
         {
-            { EditMode.Scene, "ModeScene" }, { EditMode.Object, "ModeObject" }, { EditMode.Font, "ModeFont" }
+            { EditMode.Scene, "Редактор Сцены" }, { EditMode.Object, "Редактор Объекта" }, { EditMode.Font, "Редактор Шрифтов" }
         };
-        private static readonly Dictionary<EditMode, string> ModeCreateKeys = new()
+        private static readonly Dictionary<string, EditMode> DisplayNamesToMode = new()
         {
-            { EditMode.Scene, "CtxCreateScene" }, { EditMode.Object, "CtxCreateObject" }, { EditMode.Font, "CtxAddFont" }
+            { "Редактор Сцены", EditMode.Scene }, { "Редактор Объекта", EditMode.Object }, { "Редактор Шрифтов", EditMode.Font }
         };
-        private static readonly Dictionary<EditMode, string> ModeDeleteKeys = new()
+        private static readonly Dictionary<EditMode, string> CreateCaptions = new()
         {
-            { EditMode.Scene, "CtxDeleteScene" }, { EditMode.Object, "CtxDeleteObject" }, { EditMode.Font, "CtxDeleteFont" }
+            { EditMode.Scene, "+ создать сцену" }, { EditMode.Object, "+ создать объект" }, { EditMode.Font, "+ добавить шрифт" }
         };
-        private static readonly Dictionary<AppLanguage, string> LanguageDisplayNames = new()
+        private static readonly Dictionary<EditMode, string> DeleteCaptions = new()
         {
-            { AppLanguage.Ru, "Русский" }, { AppLanguage.En, "English" }, { AppLanguage.Zh, "中文" },
-            { AppLanguage.Ar, "العربية" }, { AppLanguage.Hi, "हिन्दी" }, { AppLanguage.It, "Italiano" },
-            { AppLanguage.Fr, "Français" }, { AppLanguage.De, "Deutsch" }
+            { EditMode.Scene, "- удалить сцену" }, { EditMode.Object, "- удалить объект" }, { EditMode.Font, "- удалить шрифт" }
         };
 
         private readonly Dictionary<EditMode, Action> _modeActions;
@@ -49,17 +47,21 @@ namespace VENM
         private bool _isProcessing = false;
         private bool _updatingHideCheckbox = false;
 
-        private AppLanguage _currentLanguage = AppLanguage.Ru;
+        // 🔹 Скрытые объекты (сцена -> список объектов)
         private Dictionary<string, List<string>> _hiddenObjects = new();
-
-        // Интерактивность канваса
+        // 🔹 Объект, выбранный кликом на канвасе
         private string? _activeCanvasObject = null;
+
+        // 🔹 Интерактивность канваса
         private FrameworkElement? _draggingElement = null;
         private bool _isDragging = false;
         private bool _isResizing = false;
         private Point _dragStart;
         private double _dragOrigX, _dragOrigY, _dragOrigW, _dragOrigH;
         private readonly Dictionary<string, Dictionary<string, object?>> _pendingObjectParams = new();
+
+        // 🔹 Положение панели
+        private bool _isPanelOnRight = false;
 
         private const double SceneW = 1920;
         private const double SceneH = 1080;
@@ -70,23 +72,24 @@ namespace VENM
             Loaded += MainWindow_Loaded;
             Closed += MainWindow_Closed;
 
+            ComboEditMode.ItemsSource = new List<string>
+            {
+                ModeDisplayNames[EditMode.Scene],
+                ModeDisplayNames[EditMode.Object],
+                ModeDisplayNames[EditMode.Font]
+            };
+
             _modeActions = new Dictionary<EditMode, Action>
             {
-                { EditMode.Scene, () => { } },
-                { EditMode.Object, () => { } },
-                { EditMode.Font, () => { LoadFontParameters(); } }
+                { EditMode.Scene, () => { } }, { EditMode.Object, () => { } }, { EditMode.Font, () => { LoadFontParameters(); } }
             };
             _createActions = new Dictionary<EditMode, Func<bool>>
             {
-                { EditMode.Scene, CreateScene },
-                { EditMode.Object, CreateObjectWithTexture },
-                { EditMode.Font, AddFont }
+                { EditMode.Scene, CreateScene }, { EditMode.Object, CreateObject }, { EditMode.Font, AddFont }
             };
             _deleteActions = new Dictionary<EditMode, Func<bool>>
             {
-                { EditMode.Scene, DeleteScene },
-                { EditMode.Object, DeleteObject },
-                { EditMode.Font, DeleteFont }
+                { EditMode.Scene, DeleteScene }, { EditMode.Object, DeleteObject }, { EditMode.Font, DeleteFont }
             };
             _fileEditView = new FileEditView(TextEditor, TextPreview, JsonEditorScroll, JsonEditorPanel, JsonPreviewScroll, JsonPreviewPanel);
         }
@@ -106,16 +109,19 @@ namespace VENM
             _isAutoSaveEnabled = FileDirManager.LoadAutoSaveState();
             AutoSave.IsChecked = _isAutoSaveEnabled;
 
-            string savedLangStr = FileDirManager.LoadLanguage();
-            _currentLanguage = Enum.TryParse<AppLanguage>(savedLangStr, true, out var l) ? l : AppLanguage.Ru;
-            BuildLanguageCombo();
+            var langs = new[] { "ru", "en" };
+            ComboLanguage.ItemsSource = langs;
+            string savedLang = FileDirManager.LoadLanguage();
+            ComboLanguage.SelectedItem = langs.Contains(savedLang) ? savedLang : langs[0];
+
+            // 🔹 Загружаем положение панели
+            _isPanelOnRight = FileDirManager.LoadPanelPosition() == "right";
+            ApplyPanelPosition();
 
             DisableAllControls();
             SetupComboContextMenu(ComboScene, EditMode.Scene);
             SetupComboContextMenu(ComboObject, EditMode.Object);
             SetupComboContextMenu(ComboFile, EditMode.Font);
-
-            ApplyLanguage();
 
             string savedModeStr = FileDirManager.LoadEditMode();
             EditMode savedMode = Enum.TryParse<EditMode>(savedModeStr, out var m) && m != EditMode.None ? m : EditMode.Scene;
@@ -130,60 +136,32 @@ namespace VENM
             Application.Current?.Shutdown();
         }
 
-        #region Локализация
-        private void BuildLanguageCombo()
+        #region Переключение положения панели
+        private void BtnTogglePanel_Click(object sender, RoutedEventArgs e)
         {
-            var items = new List<ComboBoxItem>();
-            foreach (var kv in LanguageDisplayNames)
-                items.Add(new ComboBoxItem { Content = kv.Value, Tag = kv.Key });
-            _isProcessing = true;
-            ComboLanguage.ItemsSource = items;
-            ComboLanguage.SelectedItem = items.FirstOrDefault(i => (AppLanguage)i.Tag == _currentLanguage) ?? items[0];
-            _isProcessing = false;
+            _isPanelOnRight = !_isPanelOnRight;
+            ApplyPanelPosition();
+            FileDirManager.SavePanelPosition(_isPanelOnRight ? "right" : "left");
         }
 
-        private void ComboLanguage_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        private void ApplyPanelPosition()
         {
-            if (_isProcessing) return;
-            if (ComboLanguage.SelectedItem is ComboBoxItem item && item.Tag is AppLanguage lang)
+            if (_isPanelOnRight)
             {
-                _currentLanguage = lang;
-                FileDirManager.SaveLanguage(lang.ToString());
-                ApplyLanguage();
+                RootGrid.ColumnDefinitions[0].Width = new GridLength(1, GridUnitType.Star);
+                RootGrid.ColumnDefinitions[1].Width = new GridLength(200);
+                Grid.SetColumn(ContentArea, 0);
+                Grid.SetColumn(ControlPanel, 1);
+                ControlPanel.BorderThickness = new Thickness(1, 0, 0, 0);
             }
-        }
-
-        private void BuildEditModeCombo()
-        {
-            var items = new List<ComboBoxItem>();
-            foreach (var mode in new[] { EditMode.Scene, EditMode.Object, EditMode.Font })
-                items.Add(new ComboBoxItem { Content = UILocalization.Get(ModeLocKeys[mode], _currentLanguage), Tag = mode });
-            _isProcessing = true;
-            ComboEditMode.ItemsSource = items;
-            ComboEditMode.SelectedItem = items.FirstOrDefault(i => (EditMode)i.Tag == _currentEditMode) ?? items[0];
-            _isProcessing = false;
-        }
-
-        private void ApplyLanguage()
-        {
-            var lang = _currentLanguage;
-            Title = UILocalization.Get("WindowTitle", lang);
-            LblLanguage.Text = UILocalization.Get("LblLanguage", lang) + ":";
-            LblEditMode.Text = UILocalization.Get("LblEditMode", lang) + ":";
-            LblScene.Text = UILocalization.Get("LblScene", lang) + ":";
-            LblObject.Text = UILocalization.Get("LblObject", lang) + ":";
-            LblFile.Text = UILocalization.Get("LblFile", lang) + ":";
-            BtnOpenAssets.Content = UILocalization.Get("BtnOpenAssets", lang);
-            BtnCreateDemo.Content = UILocalization.Get("BtnCreateDemo", lang);
-            BtnSave.Content = UILocalization.Get("BtnSave", lang);
-            AutoSave.Content = UILocalization.Get("ChkAutoSave", lang);
-            HideObject.Content = UILocalization.Get("ChkHideObject", lang);
-            FlowDirection = UILocalization.IsRtl(lang) ? FlowDirection.RightToLeft : FlowDirection.LeftToRight;
-            BuildEditModeCombo();
-            SetupComboContextMenu(ComboScene, EditMode.Scene);
-            SetupComboContextMenu(ComboObject, EditMode.Object);
-            SetupComboContextMenu(ComboFile, EditMode.Font);
-            RenderScenePreview();
+            else
+            {
+                RootGrid.ColumnDefinitions[0].Width = new GridLength(200);
+                RootGrid.ColumnDefinitions[1].Width = new GridLength(1, GridUnitType.Star);
+                Grid.SetColumn(ControlPanel, 0);
+                Grid.SetColumn(ContentArea, 1);
+                ControlPanel.BorderThickness = new Thickness(0, 0, 1, 0);
+            }
         }
         #endregion
 
@@ -191,8 +169,9 @@ namespace VENM
         private void ComboEditMode_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
             if (_isProcessing) return;
-            if (ComboEditMode.SelectedItem is ComboBoxItem item && item.Tag is EditMode mode)
-                SwitchEditMode(mode);
+            if (ComboEditMode.SelectedItem is not string sel) return;
+            if (!DisplayNamesToMode.TryGetValue(sel, out var mode)) return;
+            SwitchEditMode(mode);
         }
 
         private void SwitchEditMode(EditMode newMode)
@@ -212,13 +191,12 @@ namespace VENM
             if (_modeActions.TryGetValue(newMode, out var act)) act?.Invoke();
 
             _isProcessing = true;
+            if (ModeDisplayNames.TryGetValue(newMode, out var displayName))
+                ComboEditMode.SelectedItem = displayName;
             ComboScene.SelectedItem = null;
             ComboObject.SelectedItem = null;
             ComboFile.SelectedItem = null;
             RefreshAllComboBoxes();
-            var items = ComboEditMode.ItemsSource as List<ComboBoxItem>;
-            var item = items?.FirstOrDefault(i => (EditMode)i.Tag == newMode);
-            if (item != null) ComboEditMode.SelectedItem = item;
             _isProcessing = false;
 
             UpdateHideObjectCheckbox();
@@ -229,11 +207,12 @@ namespace VENM
         {
             _fileEditView?.SetMode(".txt", false);
             _fileEditView?.LoadEditorContent("");
-            _fileEditView?.LoadPreviewContent(UILocalization.Get("MsgFileClosed", _currentLanguage));
+            _fileEditView?.LoadPreviewContent("Файл не открыт.\nВыберите файл из списка для начала работы.");
         }
 
         private void DisableAllControls()
         {
+            ComboEditMode.SelectedItem = null;
             ComboEditMode.IsEnabled = false;
             ComboScene.IsEnabled = false;
             ComboObject.IsEnabled = false;
@@ -351,7 +330,7 @@ namespace VENM
             _fileEditView?.SetMode(ext, isDemo);
             _fileEditView?.LoadEditorContent(content);
             string tip = FileDirManager.GetTipFilePath(path);
-            string preview = File.Exists(tip) ? FileDirManager.LoadFile(tip) : UILocalization.Get("MsgDemoNotLoaded", _currentLanguage);
+            string preview = File.Exists(tip) ? FileDirManager.LoadFile(tip) : "Демо-структура не загружена.\nНажмите 'Создать демо-структуру' для просмотра примеров.";
             _fileEditView?.LoadPreviewContent(preview);
             if (_isAutoSaveEnabled && !isDemo)
                 FileDirManager.SetupAutoSave(path, content, c => _fileEditView?.Validate() ?? true, msg => ShowError(msg));
@@ -365,7 +344,7 @@ namespace VENM
             _fileEditView?.SetMode(".json", false);
             _fileEditView?.LoadEditorContent(File.Exists(path) ? FileDirManager.LoadFile(path) : "{}");
             string tip = Path.Combine(FileDirManager.FontsPath, "parameters_tip.json");
-            string preview = File.Exists(tip) ? FileDirManager.LoadFile(tip) : UILocalization.Get("MsgDemoNotLoaded", _currentLanguage);
+            string preview = File.Exists(tip) ? FileDirManager.LoadFile(tip) : "Демо-структура не загружена.\nНажмите 'Создать демо-структуру' для просмотра примеров.";
             _fileEditView?.LoadPreviewContent(preview);
             if (_isAutoSaveEnabled) FileDirManager.SetupAutoSave(path, _fileEditView!.GetContent(), _ => true, msg => ShowError(msg));
         }
@@ -424,7 +403,7 @@ namespace VENM
         }
         #endregion
 
-        #region Просмотрщик сцены (без System.Windows.Shapes)
+        #region Просмотрщик сцены (интерактивный, без System.Windows.Shapes)
         private void RenderScenePreview()
         {
             if (SceneCanvas is null) return;
@@ -443,10 +422,11 @@ namespace VENM
                 if (bg != null) SceneCanvas.Children.Add(bg);
             }
 
-            if (HideObject.IsChecked == true) return;
-
             foreach (var obj in FileDirManager.GetObjects(_currentScene))
             {
+                // 🔹 Пропускаем только скрытые объекты (не все)
+                if (_hiddenObjects.TryGetValue(_currentScene, out var hidList) && hidList.Contains(obj)) continue;
+
                 var p = ReadJsonParams(Path.Combine(scenePath, obj, "parameters.json"));
                 double x = GetParamDouble(p, "x", 100);
                 double y = GetParamDouble(p, "y", 100);
@@ -511,20 +491,18 @@ namespace VENM
             }
         }
 
-        // 🔹 Выбор объекта на канвасе + синхронизация с ComboBox
         private void SelectCanvasObject(string obj)
         {
             if (_activeCanvasObject == obj) return;
             _activeCanvasObject = obj;
             UpdateHideObjectCheckbox();
 
-            // 🔹 СИНХРОНИЗАЦИЯ: если мы в режиме объекта, отражаем выбор в ComboObject
+            // 🔹 Синхронизация с ComboObject
             if (_currentEditMode == EditMode.Object && _currentObject != obj)
             {
                 _isProcessing = true;
                 _currentObject = obj;
                 ComboObject.SelectedItem = obj;
-                // Обновляем список файлов для нового объекта и загружаем первый файл
                 var files = GetFilesForCurrentSelection();
                 UpdateComboBox(ComboFile, files, null);
                 if (files.Count > 0)
@@ -535,13 +513,11 @@ namespace VENM
                 }
                 _isProcessing = false;
             }
-
             RenderScenePreview();
         }
 
         private void SceneCanvas_MouseDown(object sender, MouseButtonEventArgs e)
         {
-            // Клик по пустому месту — снимаем выделение
             if (e.OriginalSource == SceneCanvas || e.OriginalSource is Canvas)
             {
                 if (_activeCanvasObject != null)
@@ -557,9 +533,11 @@ namespace VENM
         {
             if (sender is not FrameworkElement el || el.Tag is not string obj) return;
             e.Handled = true;
-            SelectCanvasObject(obj);
+            // 🔹 Только запоминаем выбор, БЕЗ вызова SelectCanvasObject и RenderScenePreview,
+            // чтобы не уничтожить элемент, который мы сейчас будем перетаскивать
+            _activeCanvasObject = obj;
+            UpdateHideObjectCheckbox();
 
-            // 🔹 Захват мыши на SceneCanvas, чтобы не терять события при выходе за границы
             _draggingElement = el;
             _isDragging = true;
             _isResizing = false;
@@ -577,7 +555,9 @@ namespace VENM
             if (sender is not FrameworkElement h) return;
             if (h.Tag is not FrameworkElement container || container.Tag is not string obj) return;
             e.Handled = true;
-            SelectCanvasObject(obj);
+            // 🔹 Аналогично: без перерисовки во время захвата
+            _activeCanvasObject = obj;
+            UpdateHideObjectCheckbox();
 
             _draggingElement = container;
             _isResizing = true;
@@ -591,7 +571,6 @@ namespace VENM
             Mouse.Capture(SceneCanvas);
         }
 
-        // 🔹 ГЛОБАЛЬНЫЙ обработчик движения мыши (подписан на SceneCanvas в XAML)
         private void SceneCanvas_MouseMove(object sender, MouseEventArgs e)
         {
             if (_draggingElement == null) return;
@@ -608,23 +587,57 @@ namespace VENM
             }
         }
 
-        // 🔹 ГЛОБАЛЬНЫЙ обработчик отпускания мыши (через PreviewMouseLeftButtonUp — ловит все отпускания)
         private void SceneCanvas_MouseUp(object sender, MouseButtonEventArgs e)
         {
             if (_draggingElement == null) return;
             var el = _draggingElement;
+            string? obj = el.Tag as string;
 
-            if (el.Tag is string obj && !string.IsNullOrEmpty(obj))
+            if (!string.IsNullOrEmpty(obj))
             {
+                // 🔹 1. Фиксируем новые параметры
                 if (!_pendingObjectParams.ContainsKey(obj)) _pendingObjectParams[obj] = new Dictionary<string, object?>();
                 _pendingObjectParams[obj]["x"] = Math.Round(Canvas.GetLeft(el), 1);
                 _pendingObjectParams[obj]["y"] = Math.Round(Canvas.GetTop(el), 1);
                 _pendingObjectParams[obj]["width"] = Math.Round(el.Width, 1);
                 _pendingObjectParams[obj]["height"] = Math.Round(el.Height, 1);
+
+                // 🔹 2. СРАЗУ записываем на диск, не дожидаясь автосохранения
+                CommitPendingObjectParams();
+
+                // 🔹 3. Синхронизация с ComboObject и обновление редактора/автосохранения
+                bool redrawNeeded = true;
+                if (_currentEditMode == EditMode.Object)
+                {
+                    if (_currentObject != obj)
+                    {
+                        _isProcessing = true;
+                        _currentObject = obj;
+                        ComboObject.SelectedItem = obj;
+                        var files = GetFilesForCurrentSelection();
+                        UpdateComboBox(ComboFile, files, null);
+                        if (files.Count > 0)
+                        {
+                            ComboFile.SelectedIndex = 0;
+                            _currentFile = files[0];
+                            LoadSelectedFile();
+                            redrawNeeded = false; // LoadSelectedFile уже перерисовал сцену
+                        }
+                        _isProcessing = false;
+                    }
+                    else if (_currentFile == "parameters.json")
+                    {
+                        // Объект уже открыт в редакторе — перезагружаем,
+                        // чтобы автосохранение не перезаписало изменения старым _currentContent
+                        LoadSelectedFile();
+                        redrawNeeded = false;
+                    }
+                }
+                if (redrawNeeded) RenderScenePreview();
             }
 
-            Mouse.Capture(null);          // 🔹 Освобождаем захват мыши
-            Mouse.OverrideCursor = null;  // 🔹 Сбрасываем курсор — решаю "зависание"
+            Mouse.Capture(null);
+            Mouse.OverrideCursor = null;
             _draggingElement = null;
             _isDragging = false;
             _isResizing = false;
@@ -706,93 +719,6 @@ namespace VENM
         }
         #endregion
 
-        #region Drag & Drop на просмотрщик сцены
-        private void SceneCanvas_DragOver(object sender, DragEventArgs e)
-        {
-            bool canDrop = false;
-            if (!string.IsNullOrEmpty(_currentScene) && e.Data.GetDataPresent(DataFormats.FileDrop))
-            {
-                if (e.Data.GetData(DataFormats.FileDrop) is string[] files && files.Length > 0)
-                {
-                    canDrop = files.All(f =>
-                    {
-                        string ext = Path.GetExtension(f).ToLowerInvariant();
-                        return ext == ".png" || ext == ".jpg" || ext == ".jpeg";
-                    });
-                }
-            }
-            e.Effects = canDrop ? DragDropEffects.Copy : DragDropEffects.None;
-            e.Handled = true;
-        }
-
-        private void SceneCanvas_Drop(object sender, DragEventArgs e)
-        {
-            if (string.IsNullOrEmpty(_currentScene)) { ShowError("Сначала выберите сцену!"); return; }
-            if (!e.Data.GetDataPresent(DataFormats.FileDrop)) return;
-            if (e.Data.GetData(DataFormats.FileDrop) is not string[] files || files.Length == 0) return;
-
-            foreach (var file in files)
-            {
-                string ext = Path.GetExtension(file).ToLowerInvariant();
-                if (ext != ".png" && ext != ".jpg" && ext != ".jpeg") continue;
-
-                // Копируем текстуру в /assets/textures/
-                string texturesDir = Path.Combine(FileDirManager.AssetsPath, "textures");
-                Directory.CreateDirectory(texturesDir);
-                string fileName = Path.GetFileName(file);
-                string destPath = Path.Combine(texturesDir, fileName);
-                // Защита от дубликатов
-                if (File.Exists(destPath))
-                {
-                    string noExt = Path.GetFileNameWithoutExtension(fileName);
-                    int i = 1;
-                    while (File.Exists(Path.Combine(texturesDir, $"{noExt}_{i}{ext}"))) i++;
-                    fileName = $"{noExt}_{i}{ext}";
-                    destPath = Path.Combine(texturesDir, fileName);
-                }
-                File.Copy(file, destPath, false);
-                string relPath = $"textures/{fileName}".Replace('\\', '/');
-
-                // Имя объекта из имени файла (с валидацией)
-                string baseName = Path.GetFileNameWithoutExtension(file);
-                var sb = new StringBuilder();
-                foreach (char c in baseName)
-                    if (!Path.GetInvalidFileNameChars().Contains(c) && c != ' ') sb.Append(c);
-                string objName = sb.Length > 0 ? sb.ToString() : "dropped_object";
-
-                // Защита от дубликата имени папки объекта
-                string objDir = Path.Combine(FileDirManager.ScenesPath, _currentScene, objName);
-                if (Directory.Exists(objDir))
-                {
-                    int i = 1;
-                    while (Directory.Exists(Path.Combine(FileDirManager.ScenesPath, _currentScene, $"{objName}_{i}"))) i++;
-                    objName = $"{objName}_{i}";
-                    objDir = Path.Combine(FileDirManager.ScenesPath, _currentScene, objName);
-                }
-
-                // Создаём папку объекта с параметрами
-                Directory.CreateDirectory(objDir);
-                var parameters = new Dictionary<string, object?>
-                {
-                    ["name"] = objName,
-                    ["type"] = "character",
-                    ["sprite"] = relPath,
-                    ["x"] = 100.0,
-                    ["y"] = 100.0,
-                    ["width"] = 300.0,
-                    ["height"] = 500.0
-                };
-                string json = JsonSerializer.Serialize(parameters, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(Path.Combine(objDir, "parameters.json"), json, Encoding.UTF8);
-                File.WriteAllText(Path.Combine(objDir, "events.json"), "{}", Encoding.UTF8);
-                File.WriteAllText(Path.Combine(objDir, "speech.txt"), $"// Реплики объекта {objName}", Encoding.UTF8);
-
-                ShowNotification($"Объект '{objName}' создан из {Path.GetFileName(file)}");
-            }
-            RefreshAllComboBoxes();
-        }
-        #endregion
-
         #region Сохранение
         private void SaveCurrentFileSilently()
         {
@@ -819,7 +745,7 @@ namespace VENM
             CommitPendingObjectParams();
             if (SaveCurrentFileIfNeeded())
             {
-                ShowNotification(UILocalization.Get("MsgFileSaved", _currentLanguage));
+                ShowNotification("Файл успешно сохранён!");
                 RenderScenePreview();
             }
         }
@@ -839,7 +765,35 @@ namespace VENM
         }
         #endregion
 
+        #region Язык
+        private void ComboLanguage_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (ComboLanguage.SelectedItem is string lang)
+                FileDirManager.SaveLanguage(lang);
+        }
+        #endregion
+
         #region CRUD
+        private void ContextCreate(EditMode target)
+        {
+            if (target == EditMode.Font && _currentEditMode != EditMode.Font)
+            {
+                ShowError("Добавление шрифта доступно только в режиме редактирования шрифтов.");
+                return;
+            }
+            if (_createActions.TryGetValue(target, out var act)) act?.Invoke();
+        }
+
+        private void ContextDelete(EditMode target)
+        {
+            if (target == EditMode.Font && _currentEditMode != EditMode.Font)
+            {
+                ShowError("Удаление шрифта доступно только в режиме редактирования шрифтов.");
+                return;
+            }
+            if (_deleteActions.TryGetValue(target, out var act)) act?.Invoke();
+        }
+
         private bool CreateScene()
         {
             var d = new TextInputDialog("Создание сцены", "Введите название сцены:");
@@ -848,36 +802,13 @@ namespace VENM
             ShowError(err); return false;
         }
 
-        private bool CreateObjectWithTexture()
+        private bool CreateObject()
         {
-            if (string.IsNullOrEmpty(_currentScene))
-            {
-                ShowError(UILocalization.Get("MsgSelectSceneFirst", _currentLanguage));
-                return false;
-            }
-            var dialog = new ObjectCreationDialog();
-            if (dialog.ShowDialog() != true) return false;
-
-            string objName = dialog.ObjectName.Trim();
-            string objectType = dialog.ObjectType;
-            string textureSource = dialog.TexturePath;
-
-            string relPath = string.Empty;
-            if (!string.IsNullOrEmpty(textureSource))
-            {
-                relPath = FileDirManager.CopyTextureToAssets(textureSource, out string copyErr);
-                if (string.IsNullOrEmpty(relPath)) { ShowError(copyErr); return false; }
-            }
-
-            if (FileDirManager.CreateObjectWithParameters(_currentScene, objName, relPath,
-                    objectType, 100, 100, 300, 500, out string err))
-            {
-                RefreshAllComboBoxes();
-                ShowNotification($"Объект '{objName}' создан");
-                return true;
-            }
-            ShowError(err);
-            return false;
+            if (string.IsNullOrEmpty(_currentScene)) { ShowError("Сначала выберите сцену!"); return false; }
+            var d = new TextInputDialog("Создание объекта", "Введите название объекта:");
+            if (d.ShowDialog() != true || string.IsNullOrWhiteSpace(d.Result)) return false;
+            if (FileDirManager.CreateObject(_currentScene, d.Result.Trim(), out string err)) { RefreshAllComboBoxes(); ShowNotification($"Объект '{d.Result}' создан"); return true; }
+            ShowError(err); return false;
         }
 
         private bool AddFont()
@@ -930,43 +861,19 @@ namespace VENM
         private void SetupComboContextMenu(ComboBox cb, EditMode target)
         {
             var menu = new ContextMenu();
-
-            var createItem = new MenuItem { Header = UILocalization.Get(ModeCreateKeys[target], _currentLanguage) };
+            var createItem = new MenuItem { Header = CreateCaptions[target] };
             createItem.Click += (s, e) => ContextCreate(target);
             menu.Items.Add(createItem);
-
             if (target != EditMode.Font)
             {
-                var renameItem = new MenuItem { Header = UILocalization.Get("CtxRename", _currentLanguage) };
+                var renameItem = new MenuItem { Header = "Переименовать" };
                 renameItem.Click += (s, e) => { if (cb.SelectedItem is string n) RenameItem(target, n); };
                 menu.Items.Add(renameItem);
             }
-
-            var deleteItem = new MenuItem { Header = UILocalization.Get(ModeDeleteKeys[target], _currentLanguage) };
+            var deleteItem = new MenuItem { Header = DeleteCaptions[target] };
             deleteItem.Click += (s, e) => ContextDelete(target);
             menu.Items.Add(deleteItem);
-
             cb.ContextMenu = menu;
-        }
-
-        private void ContextCreate(EditMode target)
-        {
-            if (target == EditMode.Font && _currentEditMode != EditMode.Font)
-            {
-                ShowError("Добавление шрифта доступно только в режиме редактирования шрифтов.");
-                return;
-            }
-            if (_createActions.TryGetValue(target, out var act)) act?.Invoke();
-        }
-
-        private void ContextDelete(EditMode target)
-        {
-            if (target == EditMode.Font && _currentEditMode != EditMode.Font)
-            {
-                ShowError("Удаление шрифта доступно только в режиме редактирования шрифтов.");
-                return;
-            }
-            if (_deleteActions.TryGetValue(target, out var act)) act?.Invoke();
         }
 
         private void RenameItem(EditMode mode, string old)
@@ -991,101 +898,10 @@ namespace VENM
         #region Утилиты
         private void BtnOpenAssets_Click(object sender, RoutedEventArgs e) => FileDirManager.OpenInExplorer(FileDirManager.AssetsPath);
         private void BtnCreateDemo_Click(object sender, RoutedEventArgs e) { FileDirManager.CreateDemoStructure(); RefreshAllComboBoxes(); LoadSelectedFile(); ShowNotification("Демо-структура создана"); }
-        private void ShowNotification(string m) => MessageBox.Show(m, UILocalization.Get("MsgSuccess", _currentLanguage), MessageBoxButton.OK, MessageBoxImage.Information);
-        private void ShowError(string m) => MessageBox.Show(m, UILocalization.Get("MsgError", _currentLanguage), MessageBoxButton.OK, MessageBoxImage.Error);
+        private void ShowNotification(string m) => MessageBox.Show(m, "Успех", MessageBoxButton.OK, MessageBoxImage.Information);
+        private void ShowError(string m) => MessageBox.Show(m, "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
         #endregion
     }
-
-    #region Модальное окно создания объекта с текстурой
-    public class ObjectCreationDialog : Window
-    {
-        public string ObjectName { get; private set; } = string.Empty;
-        public string ObjectType { get; private set; } = "character";
-        public string TexturePath { get; private set; } = string.Empty;
-
-        public ObjectCreationDialog()
-        {
-            Title = "Создание объекта";
-            Width = 480; Height = 280;
-            WindowStartupLocation = WindowStartupLocation.CenterOwner;
-            Owner = Application.Current.MainWindow;
-            ResizeMode = ResizeMode.NoResize;
-
-            var grid = new Grid { Margin = new Thickness(15) };
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-
-            var lblName = new TextBlock { Text = "Имя объекта:", Margin = new Thickness(0, 0, 0, 3) };
-            var tbName = new TextBox { Margin = new Thickness(0, 0, 0, 8) };
-
-            var lblType = new TextBlock { Text = "Тип объекта:", Margin = new Thickness(0, 0, 0, 3) };
-            var cbType = new ComboBox { Margin = new Thickness(0, 0, 0, 8) };
-            cbType.ItemsSource = new[] { "character", "background", "item", "ui_element", "prop" };
-            cbType.SelectedIndex = 0;
-
-            var lblTex = new TextBlock { Text = "Текстура (необязательно):", Margin = new Thickness(0, 0, 0, 3) };
-            var texGrid = new Grid();
-            texGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            texGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var tbTex = new TextBox { IsReadOnly = true, Margin = new Thickness(0, 0, 5, 0), Background = Brushes.WhiteSmoke };
-            var btnBrowse = new Button { Content = "Обзор...", Width = 80 };
-            Grid.SetColumn(tbTex, 0);
-            Grid.SetColumn(btnBrowse, 1);
-            texGrid.Children.Add(tbTex);
-            texGrid.Children.Add(btnBrowse);
-
-            var sp = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 12, 0, 0) };
-            var ok = new Button { Content = "Создать", Width = 85, Margin = new Thickness(0, 0, 8, 0), IsDefault = true };
-            var cancel = new Button { Content = "Отмена", Width = 85, IsCancel = true };
-            sp.Children.Add(ok);
-            sp.Children.Add(cancel);
-
-            Grid.SetRow(lblName, 0); Grid.SetRow(tbName, 1);
-            Grid.SetRow(lblType, 2); Grid.SetRow(cbType, 3);
-            var texStack = new StackPanel();
-            texStack.Children.Add(lblTex);
-            texStack.Children.Add(texGrid);
-            Grid.SetRow(texStack, 4);
-            grid.Children.Add(lblName); grid.Children.Add(tbName);
-            grid.Children.Add(lblType); grid.Children.Add(cbType);
-            grid.Children.Add(texStack);
-            grid.Children.Add(sp);
-            Content = grid;
-
-            btnBrowse.Click += (s, e) =>
-            {
-                var dlg = new Microsoft.Win32.OpenFileDialog
-                {
-                    Filter = "Изображения (*.png;*.jpg;*.jpeg)|*.png;*.jpg;*.jpeg",
-                    Title = "Выберите текстуру"
-                };
-                if (dlg.ShowDialog() == true)
-                {
-                    tbTex.Text = dlg.FileName;
-                    TexturePath = dlg.FileName;
-                }
-            };
-
-            ok.Click += (s, e) =>
-            {
-                if (string.IsNullOrWhiteSpace(tbName.Text))
-                {
-                    MessageBox.Show("Введите имя объекта.", "Ошибка", MessageBoxButton.OK, MessageBoxImage.Warning);
-                    return;
-                }
-                ObjectName = tbName.Text.Trim();
-                ObjectType = cbType.SelectedItem?.ToString() ?? "character";
-                DialogResult = true;
-                Close();
-            };
-
-            tbName.Loaded += (s, e) => { tbName.Focus(); tbName.SelectAll(); };
-        }
-    }
-    #endregion
 
     public class TextInputDialog : Window
     {
