@@ -30,17 +30,22 @@ namespace VENM
         private bool _isProcessing = false;
         private bool _updatingHideCheckbox = false;
 
-        private AppLanguage _currentLanguage = AppLanguage.Ru;
         private Dictionary<string, List<string>> _hiddenObjects = new();
-        private bool _isPanelOnRight = false;
-
         private string? _activeCanvasObject = null;
+
         private FrameworkElement? _draggingElement = null;
         private bool _isDragging = false;
         private bool _isResizing = false;
         private Point _dragStart;
         private double _dragOrigX, _dragOrigY, _dragOrigW, _dragOrigH;
         private readonly Dictionary<string, Dictionary<string, object?>> _pendingObjectParams = new();
+
+        private bool _isPanelOnRight = false;
+
+        // 🔹 Буфер обмена для объектов
+        private Dictionary<string, object?>? _clipboardParams = null;
+        private string? _clipboardEvents = null;
+        private string? _clipboardSpeech = null;
 
         private const double SceneW = 1920;
         private const double SceneH = 1080;
@@ -111,6 +116,84 @@ namespace VENM
             Application.Current?.Shutdown();
         }
 
+        #region Ctrl+C / Ctrl+V
+        private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (Keyboard.Modifiers != ModifierKeys.Control) return;
+            if (_currentEditMode == EditMode.Font) return;
+
+            if (e.Key == Key.C)
+            {
+                CopySelectedObject();
+                e.Handled = true;
+            }
+            else if (e.Key == Key.V)
+            {
+                PasteObject();
+                e.Handled = true;
+            }
+        }
+
+        private void CopySelectedObject()
+        {
+            string? objToCopy = _activeCanvasObject ?? _currentObject;
+            if (objToCopy == null || string.IsNullOrEmpty(_currentScene)) return;
+
+            string objPath = Path.Combine(FileDirManager.ScenesPath, _currentScene, objToCopy);
+            if (!Directory.Exists(objPath)) return;
+
+            _clipboardParams = ReadJsonParams(Path.Combine(objPath, "parameters.json"));
+            _clipboardEvents = File.Exists(Path.Combine(objPath, "events.json"))
+                ? File.ReadAllText(Path.Combine(objPath, "events.json"), Encoding.UTF8) : "{}";
+            _clipboardSpeech = File.Exists(Path.Combine(objPath, "speech.txt"))
+                ? File.ReadAllText(Path.Combine(objPath, "speech.txt"), Encoding.UTF8) : "";
+
+            ShowNotification($"Объект '{objToCopy}' скопирован (Ctrl+V для вставки)");
+        }
+
+        private void PasteObject()
+        {
+            if (_clipboardParams == null || string.IsNullOrEmpty(_currentScene))
+            {
+                ShowError("Буфер обмена пуст или сцена не выбрана.");
+                return;
+            }
+
+            string baseName = GetParamString(_clipboardParams, "name");
+            if (string.IsNullOrEmpty(baseName)) baseName = "pasted_object";
+
+            // Генерируем уникальное имя
+            string newName = baseName + "_copy";
+            string objDir = Path.Combine(FileDirManager.ScenesPath, _currentScene, newName);
+            int counter = 1;
+            while (Directory.Exists(objDir))
+            {
+                newName = $"{baseName}_copy{counter}";
+                objDir = Path.Combine(FileDirManager.ScenesPath, _currentScene, newName);
+                counter++;
+            }
+
+            // Обновляем параметры
+            var newParams = new Dictionary<string, object?>(_clipboardParams);
+            newParams["name"] = newName;
+            // Сдвигаем позицию, чтобы объект не накладывался на оригинал
+            double origX = GetParamDouble(newParams, "x", 100);
+            double origY = GetParamDouble(newParams, "y", 100);
+            newParams["x"] = origX + 50;
+            newParams["y"] = origY + 50;
+
+            string json = JsonSerializer.Serialize(newParams, new JsonSerializerOptions { WriteIndented = true });
+
+            Directory.CreateDirectory(objDir);
+            File.WriteAllText(Path.Combine(objDir, "parameters.json"), json, new UTF8Encoding(false));
+            File.WriteAllText(Path.Combine(objDir, "events.json"), _clipboardEvents ?? "{}", new UTF8Encoding(false));
+            File.WriteAllText(Path.Combine(objDir, "speech.txt"), _clipboardSpeech ?? "", new UTF8Encoding(false));
+
+            RefreshAllComboBoxes();
+            ShowNotification($"Объект '{newName}' вставлен в сцену '{_currentScene}'");
+        }
+        #endregion
+
         #region Локализация
         private void BuildLanguageCombo()
         {
@@ -134,8 +217,8 @@ namespace VENM
             _isProcessing = true;
             ComboLanguage.ItemsSource = items;
             string savedLangStr = FileDirManager.LoadLanguage();
-            _currentLanguage = Enum.TryParse<AppLanguage>(savedLangStr, true, out var parsedLang) ? parsedLang : AppLanguage.Ru;
-            ComboLanguage.SelectedItem = items.FirstOrDefault(i => (AppLanguage)i.Tag == _currentLanguage) ?? items[0];
+            var currentLang = Enum.TryParse<AppLanguage>(savedLangStr, true, out var parsedLang) ? parsedLang : AppLanguage.Ru;
+            ComboLanguage.SelectedItem = items.FirstOrDefault(i => (AppLanguage)i.Tag == currentLang) ?? items[0];
             _isProcessing = false;
         }
 
@@ -144,7 +227,6 @@ namespace VENM
             if (_isProcessing) return;
             if (ComboLanguage.SelectedItem is ComboBoxItem item && item.Tag is AppLanguage lang)
             {
-                _currentLanguage = lang;
                 FileDirManager.SaveLanguage(lang.ToString());
                 ApplyLanguage();
             }
@@ -154,9 +236,9 @@ namespace VENM
         {
             var items = new List<string>
             {
-                UILocalization.Get("ModeScene", _currentLanguage),
-                UILocalization.Get("ModeObject", _currentLanguage),
-                UILocalization.Get("ModeFont", _currentLanguage)
+                UILocalization.Get("ModeScene", GetSavedLanguage()),
+                UILocalization.Get("ModeObject", GetSavedLanguage()),
+                UILocalization.Get("ModeFont", GetSavedLanguage())
             };
             _isProcessing = true;
             ComboEditMode.ItemsSource = items;
@@ -171,9 +253,15 @@ namespace VENM
             _isProcessing = false;
         }
 
+        private AppLanguage GetSavedLanguage()
+        {
+            string savedLangStr = FileDirManager.LoadLanguage();
+            return Enum.TryParse<AppLanguage>(savedLangStr, true, out var parsedLang) ? parsedLang : AppLanguage.Ru;
+        }
+
         private void ApplyLanguage()
         {
-            var lang = _currentLanguage;
+            var lang = GetSavedLanguage();
             Title = UILocalization.Get("WindowTitle", lang);
             LblLanguage.Text = UILocalization.Get("LblLanguage", lang) + ":";
             LblEditMode.Text = UILocalization.Get("LblEditMode", lang) + ":";
@@ -183,9 +271,9 @@ namespace VENM
             BtnOpenAssets.Content = UILocalization.Get("BtnOpenAssets", lang);
             BtnCreateDemo.Content = UILocalization.Get("BtnCreateDemo", lang);
             BtnSave.Content = UILocalization.Get("BtnSave", lang);
+            BtnTogglePanel.Content = UILocalization.Get("BtnTogglePanel", lang);
             AutoSave.Content = UILocalization.Get("ChkAutoSave", lang);
             HideObject.Content = UILocalization.Get("ChkHideObject", lang);
-            BtnTogglePanel.Content = UILocalization.Get("BtnTogglePanel", lang);
             FlowDirection = UILocalization.IsRtl(lang) ? FlowDirection.RightToLeft : FlowDirection.LeftToRight;
             BuildEditModeCombo();
             SetupComboContextMenu(ComboScene, EditMode.Scene);
@@ -208,14 +296,14 @@ namespace VENM
             if (_isPanelOnRight)
             {
                 RootGrid.ColumnDefinitions[0].Width = new GridLength(1, GridUnitType.Star);
-                RootGrid.ColumnDefinitions[1].Width = new GridLength(200);
+                RootGrid.ColumnDefinitions[1].Width = new GridLength(210);
                 Grid.SetColumn(ContentArea, 0);
                 Grid.SetColumn(ControlPanel, 1);
                 ControlPanel.BorderThickness = new Thickness(1, 0, 0, 0);
             }
             else
             {
-                RootGrid.ColumnDefinitions[0].Width = new GridLength(200);
+                RootGrid.ColumnDefinitions[0].Width = new GridLength(210);
                 RootGrid.ColumnDefinitions[1].Width = new GridLength(1, GridUnitType.Star);
                 Grid.SetColumn(ControlPanel, 0);
                 Grid.SetColumn(ContentArea, 1);
@@ -270,7 +358,7 @@ namespace VENM
         {
             _fileEditView?.SetMode(".txt", false);
             _fileEditView?.LoadEditorContent("");
-            _fileEditView?.LoadPreviewContent(UILocalization.Get("MsgFileClosed", _currentLanguage));
+            _fileEditView?.LoadPreviewContent(UILocalization.Get("MsgFileClosed", GetSavedLanguage()));
         }
 
         private void DisableAllControls()
@@ -346,6 +434,7 @@ namespace VENM
                     {
                         ComboObject.SelectedIndex = 0;
                         _currentObject = objects[0];
+                        _activeCanvasObject = objects[0]; // 🔹 Синхронизация выделения
                         var objFiles = GetFilesForCurrentSelection();
                         UpdateComboBox(ComboFile, objFiles, null);
                         if (objFiles.Count > 0) { ComboFile.SelectedIndex = 0; _currentFile = objFiles[0]; LoadSelectedFile(); }
@@ -356,8 +445,8 @@ namespace VENM
             else if (sender == ComboObject)
             {
                 _currentObject = selectedName;
+                _activeCanvasObject = selectedName; // 🔹 Синхронизация выделения
                 _currentFile = null;
-                _activeCanvasObject = null;
                 var files = GetFilesForCurrentSelection();
                 UpdateComboBox(ComboFile, files, null);
                 if (files.Count > 0) { ComboFile.SelectedIndex = 0; _currentFile = files[0]; LoadSelectedFile(); }
@@ -392,7 +481,7 @@ namespace VENM
             _fileEditView?.SetMode(ext, isDemo);
             _fileEditView?.LoadEditorContent(content);
             string tip = FileDirManager.GetTipFilePath(path);
-            string preview = File.Exists(tip) ? FileDirManager.LoadFile(tip) : UILocalization.Get("MsgDemoNotLoaded", _currentLanguage);
+            string preview = File.Exists(tip) ? FileDirManager.LoadFile(tip) : UILocalization.Get("MsgDemoNotLoaded", GetSavedLanguage());
             _fileEditView?.LoadPreviewContent(preview);
             if (_isAutoSaveEnabled && !isDemo)
                 FileDirManager.SetupAutoSave(path, content, c => _fileEditView?.Validate() ?? true, msg => ShowError(msg));
@@ -406,7 +495,7 @@ namespace VENM
             _fileEditView?.SetMode(".json", false);
             _fileEditView?.LoadEditorContent(File.Exists(path) ? FileDirManager.LoadFile(path) : "{}");
             string tip = Path.Combine(FileDirManager.FontsPath, "parameters_tip.json");
-            string preview = File.Exists(tip) ? FileDirManager.LoadFile(tip) : UILocalization.Get("MsgDemoNotLoaded", _currentLanguage);
+            string preview = File.Exists(tip) ? FileDirManager.LoadFile(tip) : UILocalization.Get("MsgDemoNotLoaded", GetSavedLanguage());
             _fileEditView?.LoadPreviewContent(preview);
             if (_isAutoSaveEnabled) FileDirManager.SetupAutoSave(path, _fileEditView!.GetContent(), _ => true, msg => ShowError(msg));
         }
@@ -471,8 +560,8 @@ namespace VENM
             if (SceneCanvas is null) return;
             SceneCanvas.Children.Clear();
 
-            if (_currentEditMode == EditMode.Font) { AddSceneLabel(UILocalization.Get("MsgFontModeNoPreview", _currentLanguage)); return; }
-            if (_currentEditMode == EditMode.None || string.IsNullOrEmpty(_currentScene)) { AddSceneLabel(UILocalization.Get("MsgSceneNotSelected", _currentLanguage)); return; }
+            if (_currentEditMode == EditMode.Font) { AddSceneLabel(UILocalization.Get("MsgFontModeNoPreview", GetSavedLanguage())); return; }
+            if (_currentEditMode == EditMode.None || string.IsNullOrEmpty(_currentScene)) { AddSceneLabel(UILocalization.Get("MsgSceneNotSelected", GetSavedLanguage())); return; }
 
             string scenePath = Path.Combine(FileDirManager.ScenesPath, _currentScene);
             var sceneParams = ReadJsonParams(Path.Combine(scenePath, "parameters.json"));
@@ -526,7 +615,8 @@ namespace VENM
                     container.Children.Add(placeholder);
                 }
 
-                bool isSelected = obj == _activeCanvasObject;
+                // 🔹 Выделение объекта рамкой — независимо от способа выбора
+                bool isSelected = obj == _activeCanvasObject || obj == _currentObject;
                 if (isSelected)
                 {
                     container.Children.Add(new Border { BorderBrush = Brushes.DodgerBlue, BorderThickness = new Thickness(3), IsHitTestVisible = false });
@@ -768,7 +858,7 @@ namespace VENM
 
         private void SceneCanvas_Drop(object sender, DragEventArgs e)
         {
-            if (string.IsNullOrEmpty(_currentScene)) { ShowError(UILocalization.Get("MsgSelectSceneFirst", _currentLanguage)); return; }
+            if (string.IsNullOrEmpty(_currentScene)) { ShowError(UILocalization.Get("MsgSelectSceneFirst", GetSavedLanguage())); return; }
             if (!e.Data.GetDataPresent(DataFormats.FileDrop)) return;
             if (e.Data.GetData(DataFormats.FileDrop) is not string[] files || files.Length == 0) return;
 
@@ -831,7 +921,7 @@ namespace VENM
             CommitPendingObjectParams();
             if (SaveCurrentFileIfNeeded())
             {
-                ShowNotification(UILocalization.Get("MsgFileSaved", _currentLanguage));
+                ShowNotification(UILocalization.Get("MsgFileSaved", GetSavedLanguage()));
                 RenderScenePreview();
             }
         }
@@ -884,7 +974,7 @@ namespace VENM
         {
             if (string.IsNullOrEmpty(_currentScene))
             {
-                ShowError(UILocalization.Get("MsgSelectSceneFirst", _currentLanguage));
+                ShowError(UILocalization.Get("MsgSelectSceneFirst", GetSavedLanguage()));
                 return false;
             }
             var dialog = new ObjectCreationDialog();
@@ -961,6 +1051,7 @@ namespace VENM
         #region Контекстное меню & Переименование
         private void SetupComboContextMenu(ComboBox cb, EditMode target)
         {
+            var lang = GetSavedLanguage();
             var menu = new ContextMenu();
             string createKey = target switch
             {
@@ -976,16 +1067,16 @@ namespace VENM
                 EditMode.Font => "CtxDeleteFont",
                 _ => "CtxDeleteScene"
             };
-            var createItem = new MenuItem { Header = UILocalization.Get(createKey, _currentLanguage) };
+            var createItem = new MenuItem { Header = UILocalization.Get(createKey, lang) };
             createItem.Click += (s, e) => ContextCreate(target);
             menu.Items.Add(createItem);
             if (target != EditMode.Font)
             {
-                var renameItem = new MenuItem { Header = UILocalization.Get("CtxRename", _currentLanguage) };
+                var renameItem = new MenuItem { Header = UILocalization.Get("CtxRename", lang) };
                 renameItem.Click += (s, e) => { if (cb.SelectedItem is string n) RenameItem(target, n); };
                 menu.Items.Add(renameItem);
             }
-            var deleteItem = new MenuItem { Header = UILocalization.Get(deleteKey, _currentLanguage) };
+            var deleteItem = new MenuItem { Header = UILocalization.Get(deleteKey, lang) };
             deleteItem.Click += (s, e) => ContextDelete(target);
             menu.Items.Add(deleteItem);
             cb.ContextMenu = menu;
@@ -1002,6 +1093,7 @@ namespace VENM
             if (ok)
             {
                 if (mode == EditMode.Scene) _currentScene = n; else _currentObject = n;
+                if (mode == EditMode.Object) _activeCanvasObject = n;
                 _isProcessing = true; RefreshAllComboBoxes(); _isProcessing = false;
                 if (isOpen) LoadSelectedFile();
                 ShowNotification("Переименовано");
@@ -1013,8 +1105,8 @@ namespace VENM
         #region Утилиты
         private void BtnOpenAssets_Click(object sender, RoutedEventArgs e) => FileDirManager.OpenInExplorer(FileDirManager.AssetsPath);
         private void BtnCreateDemo_Click(object sender, RoutedEventArgs e) { FileDirManager.CreateDemoStructure(); RefreshAllComboBoxes(); LoadSelectedFile(); ShowNotification("Демо-структура создана"); }
-        private void ShowNotification(string m) => MessageBox.Show(m, UILocalization.Get("MsgSuccess", _currentLanguage), MessageBoxButton.OK, MessageBoxImage.Information);
-        private void ShowError(string m) => MessageBox.Show(m, UILocalization.Get("MsgError", _currentLanguage), MessageBoxButton.OK, MessageBoxImage.Error);
+        private void ShowNotification(string m) => MessageBox.Show(m, UILocalization.Get("MsgSuccess", GetSavedLanguage()), MessageBoxButton.OK, MessageBoxImage.Information);
+        private void ShowError(string m) => MessageBox.Show(m, UILocalization.Get("MsgError", GetSavedLanguage()), MessageBoxButton.OK, MessageBoxImage.Error);
         #endregion
     }
 
